@@ -20,14 +20,14 @@ pip install opencv-python numpy
    ```
 4. Run the script:
    ```bash
-   python innebandyDomare.py
+   python floorball_video_assist.py
    ```
 
 ## Camera Selection
 - By default, the script tries to use camera index 1 (usually an external webcam)
 - If this fails, it will fall back to camera index 0 (typically a built-in webcam)
 - To manually change the camera, edit the `camera_index` variable in the script
-- The script now uses DirectShow (CAP_DSHOW) for better Windows compatibility
+- The script uses DirectShow (CAP_DSHOW) for better Windows compatibility
 
 ## Instructions for Use
 1. **Select Goal Area**: 
@@ -38,23 +38,29 @@ pip install opencv-python numpy
 2. **Goal Detection**: 
    - The script will track the ball in real-time
    - When the ball enters the defined goal area, it registers a goal
-   - A slow-motion replay will show after each goal
+   - For a goal to count, the ball must:
+     - Enter the goal area
+     - Have been outside the goal area for at least 5 seconds
+     - Occur after the goal cooldown period has passed
+   - The system will continue recording for a moment after the goal
+   - A slow-motion replay will show twice after each goal
    - Goal information is displayed on screen and logged to `goal_log.txt`
 
 3. **Control Keys**:
    - Press 'q' to exit the program
    - Press 'd' to toggle debug view (shows contours and masks)
    - Press 'a' to toggle alternative ball detection method for difficult lighting
+   - Press 'r' to manually reset ball tracking status if needed
 
 ## Troubleshooting
 - **Ball Not Being Detected**:
   - Toggle the alternative detection method with 'a' key
-  - The script now shows debugging views to help adjust detection parameters
+  - The script shows debugging views to help adjust detection parameters
   - If needed, adjust the HSV values (`lower_white` and `upper_white`) for your specific ball/lighting
   - Ensure good lighting with minimal shadows for best detection
   
 - **Camera Errors**:
-  - The script now has automatic camera recovery for most common errors
+  - The script has automatic camera recovery for most common errors
   - If you see "Failed to grab frame" messages, the script will attempt to reset the connection
   - Ensure no other applications are using your camera
   - Try disconnecting and reconnecting the camera if issues persist
@@ -71,3 +77,4 @@ containing timestamps of detected goals.
 - Maximize contrast between the ball and background
 - For a beige floor surface, try increasing the brightness of your scene
 - Position the camera to minimize glare on the playing surface
+- Watch the "GOAL READY" indicator to know when the system can detect a new goal

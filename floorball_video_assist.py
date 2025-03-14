@@ -44,6 +44,16 @@ class FloorballReferee:
         self.use_alternative_detection = False
         self.ball_history = []  # Track recent ball positions for smoothing
 
+        # Add post-goal recording duration
+        self.post_goal_frames = 15  # Frames to record after goal detection
+        self.recording_post_goal = False
+        self.post_goal_counter = 0
+
+        # Add variables to track when ball leaves goal area
+        self.ball_left_goal_area = True
+        self.ball_left_goal_time = 0
+        self.required_time_outside_goal = 5  # seconds ball must be outside goal before new goal counts
+
     def initialize_camera(self):
         """Initialize the camera with error handling and retry capability"""
         try:
@@ -316,23 +326,54 @@ class FloorballReferee:
                 current_time = time.time()
                 ball_in_goal_now = ball_position and self.is_goal(ball_position)
                 
-                # Only trigger goal when ball enters goal area (not already in)
-                # and after cooldown period has passed
-                if (ball_in_goal_now and not ball_in_goal and 
-                    current_time - self.last_goal_time > self.goal_cooldown):
+                # Track when ball leaves the goal area
+                if ball_in_goal and not ball_in_goal_now:
+                    self.ball_left_goal_area = True
+                    self.ball_left_goal_time = current_time
+                
+                # Reset ball_left_goal_area flag if ball re-enters goal without waiting
+                if not self.ball_left_goal_area and ball_in_goal_now:
+                    self.ball_left_goal_area = False
+                
+                # Handle recording post-goal footage
+                if self.recording_post_goal:
+                    # Continue recording post-goal action
+                    self.post_goal_counter += 1
                     
+                    # When we've collected enough frames after the goal
+                    if self.post_goal_counter >= self.post_goal_frames:
+                        self.recording_post_goal = False
+                        self.post_goal_counter = 0
+                        
+                        # Now start the replay
+                        self.replay_frames = replay_buffer.copy()
+                        self.show_replay = True
+                        self.replay_index = 0
+                        self.replay_count = 0
+                # Check if enough time has passed since ball left goal area
+                # AND ball is now back in goal area AND we're not in cooldown
+                elif (ball_in_goal_now and not ball_in_goal and 
+                      self.ball_left_goal_area and
+                      current_time - self.ball_left_goal_time >= self.required_time_outside_goal and
+                      current_time - self.last_goal_time > self.goal_cooldown):
+                    
+                    # Goal conditions met
                     self.goal_count += 1
                     self.last_goal_time = current_time
+                    # Reset ball_left_goal_area flag since we're counting a new goal
+                    self.ball_left_goal_area = False
                     
                     # Log the goal
                     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     logging.info(f"GOAL! Total count: {self.goal_count} at {timestamp}")
                     
-                    # Prepare replay
-                    self.replay_frames = replay_buffer.copy()
-                    self.show_replay = True
-                    self.replay_index = 0
-                    self.replay_count = 0
+                    # Start post-goal recording
+                    self.recording_post_goal = True
+                    self.post_goal_counter = 0
+                    
+                    # Visual indicator that goal was detected
+                    cv2.putText(frame, "GOAL DETECTED!", (frame.shape[1]//2 - 100, frame.shape[0]//2),
+                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
                 
                 # Update ball_in_goal flag for next iteration
                 ball_in_goal = ball_in_goal_now
@@ -342,10 +383,33 @@ class FloorballReferee:
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                 
                 # Show time until next possible goal
+                goal_ready = self.ball_left_goal_area and (current_time - self.ball_left_goal_time >= self.required_time_outside_goal)
+                
+                if not goal_ready and self.ball_left_goal_area:
+                    # Show time since ball left goal area
+                    time_since_left = current_time - self.ball_left_goal_time
+                    time_remaining = max(0, self.required_time_outside_goal - time_since_left)
+                    cv2.putText(frame, f"Ball outside goal: {time_since_left:.1f}s / {self.required_time_outside_goal}s", 
+                              (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 165, 0), 2)
+                elif not self.ball_left_goal_area:
+                    cv2.putText(frame, "Ball must leave goal area", 
+                              (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                
                 cooldown_remaining = max(0, self.goal_cooldown - (current_time - self.last_goal_time))
                 if cooldown_remaining > 0:
-                    cv2.putText(frame, f"Cooldown: {cooldown_remaining:.1f}s", (10, 60),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                    cv2.putText(frame, f"Cooldown: {cooldown_remaining:.1f}s", 
+                              (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                
+                # Goal readiness indicator
+                goal_status_color = (0, 255, 0) if (goal_ready and cooldown_remaining == 0) else (0, 0, 255)
+                cv2.putText(frame, "GOAL READY" if (goal_ready and cooldown_remaining == 0) else "NOT READY", 
+                          (frame.shape[1] - 150, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, goal_status_color, 2)
+                
+                # If we're recording post-goal, show an indicator
+                if self.recording_post_goal:
+                    cv2.putText(frame, f"Recording goal... {self.post_goal_counter}/{self.post_goal_frames}", 
+                                (frame.shape[1] - 300, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 
                 # Show the frame
                 cv2.imshow("Floorball Referee", frame)
@@ -360,6 +424,11 @@ class FloorballReferee:
                     # Toggle alternative detection method
                     self.use_alternative_detection = not self.use_alternative_detection
                     print(f"Alternative detection: {'ON' if self.use_alternative_detection else 'OFF'}")
+                elif key == ord('r'):
+                    # Manual reset of ball tracking status
+                    self.ball_left_goal_area = True
+                    self.ball_left_goal_time = current_time - self.required_time_outside_goal
+                    print("Manual reset of ball tracking status")
                 
             except Exception as e:
                 print(f"Error in main loop: {e}")
