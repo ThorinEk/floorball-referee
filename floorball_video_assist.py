@@ -37,8 +37,8 @@ class FloorballReferee:
         
         # Create color ranges that work better with beige background
         # HSV range for white ball (wider range to account for lighting)
-        self.lower_white = np.array([0, 0, 180])  # Low saturation, high value
-        self.upper_white = np.array([180, 50, 255])  # Allow any hue, low saturation, high value
+        self.lower_white = np.array([0, 0, 160])  # Lower value threshold for better detection
+        self.upper_white = np.array([180, 60, 255])  # Higher saturation threshold
         
         # Alternative detection parameters
         self.use_alternative_detection = False
@@ -53,6 +53,56 @@ class FloorballReferee:
         self.ball_left_goal_area = True
         self.ball_left_goal_time = 0
         self.required_time_outside_goal = 5  # seconds ball must be outside goal before new goal counts
+
+        # Add background subtraction for motion detection
+        self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=50, varThreshold=16, detectShadows=False)
+        self.prev_frame = None
+        self.min_movement_area = 20  # Minimum area for movement detection
+        self.ball_confidence_threshold = 0.5  # Lowered threshold to detect ball more easily
+        self.motion_weight = 0.5  # Reduced weight for motion (was 0.7) to detect slower movements
+        self.frame_counter = 0  # Counter for processing every N frames
+        self.process_every_n_frames = 2  # Process every 2nd frame for motion detection
+        self.last_valid_detection = None
+        self.frames_since_valid_detection = 0
+        self.max_frames_without_detection = 15  # Increased to maintain tracking longer
+        
+        # Add performance monitoring
+        self.fps_values = []
+        self.last_fps_update = time.time()
+        self.fps = 0
+        self.fps_update_interval = 1.0  # Update FPS every second
+        
+        # Debug window control
+        self.debug_mode = False  # Set to False by default to hide debug windows
+        self.show_motion_mask = False
+        self.show_color_mask = False
+        self.show_combined_mask = False
+        self.show_candidates = False
+        self.debug_scale = 0.5  # Scale factor for debug windows (smaller = better performance)
+
+        # Add parameters to control detection balance between color and motion
+        self.use_pure_color_detection = False  # Toggle to use only color-based detection
+        self.color_detection_weight = 0.9  # Default to higher color weight (better for white on beige)
+        self.motion_detection_weight = 0.1  # Lower motion weight
+        
+        # Add tracking for stationary objects to filter out sunlight spots
+        self.stationary_objects = []  # List to track potentially stationary objects
+        self.stationary_threshold = 10  # Number of frames to consider an object stationary
+        self.position_stability_radius = 10  # Maximum movement (in pixels) still considered "same position"
+        self.stationary_penalty = 0.5  # Penalty factor for stationary objects
+        self.recent_positions = []  # Track recent positions to detect movement pattern
+        self.frames_to_track = 15  # Number of frames to track for movement analysis
+
+        # Update default values based on user experience
+        self.color_detection_weight = 1.0  # Start with pure color detection by default
+        self.motion_detection_weight = 0.0  # No motion weight by default
+        self.use_pure_color_detection = True  # Enable pure color mode by default
+        
+        # Add blue ball detection capability
+        self.use_blue_ball = False  # Toggle for blue ball detection
+        # HSV range for blue ball
+        self.lower_blue = np.array([100, 50, 50])  # Blue hue, moderate saturation and value
+        self.upper_blue = np.array([130, 255, 255])  # Upper blue range
 
     def initialize_camera(self):
         """Initialize the camera with error handling and retry capability"""
@@ -132,43 +182,103 @@ class FloorballReferee:
         return True
 
     def detect_ball(self, frame):
-        """Detect the white ball using improved methods"""
+        """Detect the white ball using improved methods with motion detection"""
+        # Record time for performance measurement
+        start_time = time.time()
+        
         # Convert to HSV color space
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
-        # Standard HSV-based mask
-        mask = cv2.inRange(hsv, self.lower_white, self.upper_white)
+        # Increment frame counter
+        self.frame_counter += 1
+        
+        # Define kernel for morphological operations first, so it's available everywhere
+        kernel = np.ones((3, 3), np.uint8)
+        
+        # Apply background subtraction to detect motion
+        fg_mask = self.bg_subtractor.apply(frame)
+        
+        # Process motion detection every N frames to reduce noise
+        if self.frame_counter % self.process_every_n_frames == 0:
+            # Apply morphological operations to clean up the mask
+            fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel)
+            fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel)
+        
+        # Compute absolute difference between current and previous frame for motion detection
+        motion_mask = np.zeros_like(gray)
+        if self.prev_frame is not None:
+            frame_diff = cv2.absdiff(gray, self.prev_frame)
+            # Lower threshold to detect slower movements (was 15)
+            motion_mask = cv2.threshold(frame_diff, 10, 255, cv2.THRESH_BINARY)[1]
+            motion_mask = cv2.dilate(motion_mask, kernel, iterations=1)
+            
+            # Combine motion detection with background subtraction - use OR instead of AND to be more permissive
+            if not self.use_pure_color_detection:
+                # Use weighted combination instead of strict AND
+                # This allows detection when either motion OR background subtraction detects something
+                fg_mask = cv2.addWeighted(fg_mask, 0.7, motion_mask, 0.3, 0)
+                # Apply threshold to make it binary again
+                _, fg_mask = cv2.threshold(fg_mask, 30, 255, cv2.THRESH_BINARY)
+        
+        # Update previous frame
+        self.prev_frame = gray.copy()
+        
+        # Generate appropriate color mask based on ball color
+        if self.use_blue_ball:
+            # Use HSV range for blue ball
+            color_mask = cv2.inRange(hsv, self.lower_blue, self.upper_blue)
+            # Show indicator that we're detecting blue ball
+            if self.debug_mode:
+                print("Using blue ball detection mode")
+        else:
+            # Standard HSV-based mask for white ball - more permissive for beige background
+            color_mask = cv2.inRange(hsv, self.lower_white, self.upper_white)
         
         # Improve detection with morphological operations
-        kernel = np.ones((5, 5), np.uint8)
-        mask = cv2.erode(mask, kernel, iterations=1)
-        mask = cv2.dilate(mask, kernel, iterations=2)
+        # Note: kernel is already defined above
+        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, kernel)
+        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, kernel)
         
-        # If standard detection is struggling, use alternative method
-        if self.use_alternative_detection:
-            # Enhance contrast
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            gray = cv2.equalizeHist(gray)
+        # If using pure color detection mode, just use the color mask
+        # Otherwise combine color and motion information
+        if self.use_pure_color_detection:
+            combined_mask = color_mask
+        else:
+            # Create weighted combination of color and motion masks
+            # Higher weight to color for white ball on beige background
+            combined_mask = cv2.addWeighted(
+                color_mask, self.color_detection_weight, 
+                fg_mask, self.motion_detection_weight, 0
+            )
+            # Convert back to binary
+            _, combined_mask = cv2.threshold(combined_mask, 30, 255, cv2.THRESH_BINARY)
+        
+        # Find contours in the combined mask
+        contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Only show debug windows if debug mode is enabled
+        if self.debug_mode:
+            # Scale down debug windows for better performance
+            debug_scale = self.debug_scale
             
-            # Adaptive thresholding
-            binary = cv2.adaptiveThreshold(
-                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                cv2.THRESH_BINARY, 11, 2)
-                
-            # Combine methods
-            mask = cv2.bitwise_or(mask, binary)
+            if self.show_motion_mask:
+                small_fg_mask = cv2.resize(fg_mask, (0, 0), fx=debug_scale, fy=debug_scale)
+                cv2.imshow("Motion Mask", small_fg_mask)
+            
+            if self.show_color_mask:
+                small_color_mask = cv2.resize(color_mask, (0, 0), fx=debug_scale, fy=debug_scale)
+                cv2.imshow("Color Mask", small_color_mask)
+            
+            if self.show_combined_mask:
+                small_combined_mask = cv2.resize(combined_mask, (0, 0), fx=debug_scale, fy=debug_scale)
+                cv2.imshow("Combined Mask", small_combined_mask)
+            
+            if self.show_candidates:
+                debug_frame = frame.copy()
         
-        # Find contours to identify the ball
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        # Debug visualization
-        debug_frame = frame.copy()
-        cv2.drawContours(debug_frame, contours, -1, (0, 255, 0), 2)
-        cv2.imshow("Debug Mask", mask)
-        cv2.imshow("Debug Contours", debug_frame)
-        
-        ball_position = None
-        max_confidence = 0
+        # Sort contours by their potential to be the ball
+        ball_candidates = []
         
         for contour in contours:
             # Filter contours that could be the ball
@@ -187,38 +297,174 @@ class FloorballReferee:
             ((x, y), radius) = cv2.minEnclosingCircle(contour)
             
             # Check if the detected object matches our criteria for a ball
-            if (self.min_ball_radius <= radius <= self.max_ball_radius and 
-                circularity > 0.5):  # More circular shapes have values closer to 1
+            if (self.min_ball_radius <= radius <= self.max_ball_radius):
+                # Score the candidate based on multiple factors
+                shape_score = circularity  # Perfect circle has circularity = 1
+                size_score = 1 - abs(radius - 12) / 15  # Normalize size score (optimal radius around 12px)
                 
-                confidence = circularity * (1 - abs(radius - 15) / 15)  # Ideal size around 15px
+                # Calculate motion score based on average pixel intensity in motion mask
+                # at the ball position
+                mask_roi = fg_mask[max(0, int(y-radius)):min(frame.shape[0], int(y+radius)), 
+                                  max(0, int(x-radius)):min(frame.shape[1], int(x+radius))]
+                if mask_roi.size > 0:
+                    motion_score = np.mean(mask_roi) / 255
+                else:
+                    motion_score = 0
                 
-                if confidence > max_confidence:
-                    max_confidence = confidence
-                    ball_position = (int(x), int(y), int(radius))
+                # Calculate color score based on selected ball color
+                hsv_roi = hsv[max(0, int(y-radius)):min(frame.shape[0], int(y+radius)), 
+                             max(0, int(x-radius)):min(frame.shape[1], int(x+radius))]
+                if hsv_roi.size > 0:
+                    if self.use_blue_ball:
+                        # For blue ball: look for blue hue with good saturation
+                        blue_pixels = np.sum((hsv_roi[:,:,0] > 100) & (hsv_roi[:,:,0] < 130) & 
+                                            (hsv_roi[:,:,1] > 50)) / (hsv_roi.shape[0] * hsv_roi.shape[1])
+                        color_score = blue_pixels
+                    else:
+                        # For white ball: look for low saturation and high value
+                        white_pixels = np.sum((hsv_roi[:,:,1] < 60) & (hsv_roi[:,:,2] > 160)) / (hsv_roi.shape[0] * hsv_roi.shape[1])
+                        color_score = white_pixels
+                else:
+                    color_score = 0
+                
+                # Calculate temporal consistency score if we have history
+                temporal_score = 0
+                if self.ball_history:
+                    last_pos = self.ball_history[-1]
+                    # Calculate distance to last known position
+                    distance = np.sqrt((x - last_pos[0])**2 + (y - last_pos[1])**2)
+                    # Normalize distance score - closer is better
+                    max_expected_distance = 50  # Maximum expected movement between frames
+                    temporal_score = max(0, 1 - (distance / max_expected_distance))
+                else:
+                    temporal_score = 0.5  # Neutral score if no history
+                
+                # Weighted total score
+                total_score = (0.3 * shape_score + 0.25 * size_score + 
+                              0.15 * motion_score + 0.2 * color_score + 
+                              0.1 * temporal_score)
+                
+                # Calculate position stability score
+                position = (int(x), int(y))
+                stability_score = self.calculate_position_stability(position)
+                
+                # Adjusted weights for beige floor - prioritize shape and color
+                # Include stability score to penalize stationary objects
+                total_score *= stability_score  # Multiply by stability score as a penalty factor
+                
+                ball_candidates.append({
+                    'position': (int(x), int(y), int(radius)),
+                    'score': total_score,
+                    'area': area,
+                    'circularity': circularity,
+                    'stability': stability_score
+                })
         
-        # If using position tracking, smooth the detection
-        if ball_position and self.ball_history:
-            # Average with recent positions for smoothing
-            recent_positions = self.ball_history[-3:] if len(self.ball_history) >= 3 else self.ball_history
-            x_avg = sum([pos[0] for pos in recent_positions]) / len(recent_positions)
-            y_avg = sum([pos[1] for pos in recent_positions]) / len(recent_positions)
+        # Debug drawing - only if in debug mode and candidates window is enabled
+        if self.debug_mode and self.show_candidates and 'debug_frame' in locals():
+            for i, candidate in enumerate(ball_candidates):
+                x, y, radius = candidate['position']
+                score = candidate['score']
+                color = (0, 255 * score, 255 * (1 - score))  # Color based on score
+                cv2.circle(debug_frame, (x, y), radius, color, 2)
+                cv2.putText(debug_frame, f"{score:.2f}", (x, y), 
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
             
-            # Check if new detection is reasonable (not too far from recent positions)
-            if abs(x_avg - ball_position[0]) < 50 and abs(y_avg - ball_position[1]) < 50:
-                # Blend new detection with average for smoother tracking
-                ball_position = (
-                    int(0.7 * ball_position[0] + 0.3 * x_avg),
-                    int(0.7 * ball_position[1] + 0.3 * y_avg),
-                    ball_position[2]
-                )
+            # Scale down debug frame for better performance
+            small_debug_frame = cv2.resize(debug_frame, (0, 0), fx=debug_scale, fy=debug_scale)
+            cv2.imshow("Ball Candidates", small_debug_frame)
         
-        # Update position history
-        if ball_position:
-            self.ball_history.append(ball_position)
-            if len(self.ball_history) > 10:
-                self.ball_history.pop(0)
+        # Select the best candidate
+        ball_position = None
+        candidates_with_info = []  # Store candidates with scores for access from main loop
         
-        return ball_position
+        if ball_candidates:
+            # Sort by score
+            ball_candidates.sort(key=lambda x: x['score'], reverse=True)
+            best_candidate = ball_candidates[0]
+            
+            if best_candidate['score'] >= self.ball_confidence_threshold:
+                ball_position = best_candidate['position']
+                self.last_valid_detection = ball_position
+                self.frames_since_valid_detection = 0
+                
+                # Save all candidate info for use in main loop
+                candidates_with_info = ball_candidates.copy()
+                
+                # Update position history with valid detection
+                self.ball_history.append(ball_position)
+                if len(self.ball_history) > 10:
+                    self.ball_history.pop(0)
+                    
+                # Update recent positions for stability tracking
+                self.recent_positions.append((ball_position[0], ball_position[1]))
+                if len(self.recent_positions) > self.frames_to_track:
+                    self.recent_positions.pop(0)
+            else:
+                # No good detection in this frame
+                self.frames_since_valid_detection += 1
+        else:
+            # No candidates found
+            self.frames_since_valid_detection += 1
+        
+        # If we've lost tracking but had a recent valid detection, use that
+        if (ball_position is None and self.last_valid_detection is not None and 
+            self.frames_since_valid_detection < self.max_frames_without_detection):
+            ball_position = self.last_valid_detection
+        
+        # Update FPS calculation
+        processing_time = time.time() - start_time
+        self.fps_values.append(1.0 / max(processing_time, 0.001))  # Avoid division by zero
+        
+        # Calculate average FPS over time
+        current_time = time.time()
+        if current_time - self.last_fps_update > self.fps_update_interval:
+            self.fps = np.mean(self.fps_values)
+            self.fps_values = []
+            self.last_fps_update = current_time
+            
+        return ball_position, candidates_with_info  # Return both position and candidate data
+
+    def calculate_position_stability(self, current_position):
+        """
+        Calculate a score that penalizes objects that stay in the same position
+        Returns 1.0 for moving objects and a lower score for stationary objects
+        """
+        if not self.recent_positions:
+            return 1.0  # No history, assume moving
+        
+        # Check if the current position is similar to previous positions
+        x, y = current_position
+        similar_positions = 0
+        total_positions = len(self.recent_positions)
+        
+        for pos in self.recent_positions:
+            prev_x, prev_y = pos
+            distance = np.sqrt((x - prev_x)**2 + (y - prev_y)**2)
+            if distance < self.position_stability_radius:
+                similar_positions += 1
+        
+        # Calculate stability ratio - how often the object has been in this position
+        stability_ratio = similar_positions / total_positions if total_positions > 0 else 0
+        
+        # If the object has been in roughly the same position for a while, penalize it
+        if stability_ratio > 0.8:  # 80% of recent frames in the same position
+            # Calculate movement variance to differentiate between totally static and slightly moving objects
+            if len(self.recent_positions) >= 3:
+                positions = np.array(self.recent_positions)
+                variance = np.var(positions, axis=0).sum()  # Sum of variance in x and y directions
+                
+                # If almost no variance, likely a static bright spot like sunlight
+                if variance < 5:  # Very low variance threshold
+                    return 0.2  # Heavily penalize static objects
+                elif variance < 20:  # Low variance but some movement
+                    return 0.5  # Moderate penalty for slow-moving objects
+                else:
+                    return 0.8  # Slight penalty for objects that move but return to same area
+            
+            return 0.5  # Default penalty if not enough history
+        
+        return 1.0  # No penalty for moving objects
 
     def is_goal(self, ball_position):
         """Check if the ball is in the goal area"""
@@ -288,6 +534,26 @@ class FloorballReferee:
         # Toggle for debug view
         show_debug = False
         
+        # Allow background subtractor to learn initial background
+        print("Learning background... Please wait.")
+        for _ in range(30):  # Learn from 30 frames
+            ret, frame = self.camera.read()
+            if ret:
+                self.bg_subtractor.apply(frame)
+        
+        # When initializing
+        print("Starting goal detection with optimized settings...")
+        print(f"Default color weight: {self.color_detection_weight:.1f}, motion weight: {self.motion_detection_weight:.1f}")
+        print("Press 'c' to toggle pure color detection mode")
+        print("Press '+'/'-' to adjust color/motion balance")
+        print("Press 'd' to show debug windows")
+        
+        # Before entering main loop, add instructions for the recommended setting
+        print("TIP: For best detection of white ball on beige floor, try:")
+        print("  - Pure color mode (press 'c')")
+        print("  - Or color weight 0.9 (press '+' a few times)")
+        print("  - Reset background model if lighting changes (press 'b')")
+        
         while True:
             try:
                 if self.show_replay:
@@ -308,8 +574,14 @@ class FloorballReferee:
                 if len(replay_buffer) > replay_buffer_size:
                     replay_buffer.pop(0)
                 
-                # Detect the ball
-                ball_position = self.detect_ball(frame)
+                # Detect the ball - updated to receive both position and candidates
+                detection_result = self.detect_ball(frame)
+                if isinstance(detection_result, tuple) and len(detection_result) == 2:
+                    ball_position, ball_candidates = detection_result
+                else:
+                    # Handle case if detect_ball wasn't updated yet
+                    ball_position = detection_result
+                    ball_candidates = []
                 
                 # Draw the goal area
                 if self.goal_area:
@@ -321,6 +593,20 @@ class FloorballReferee:
                     x, y, radius = ball_position
                     cv2.circle(frame, (x, y), radius, (0, 0, 255), 2)
                     cv2.circle(frame, (x, y), 2, (0, 0, 255), -1)
+                    
+                    # When drawing detected ball, show stability score
+                    if self.debug_mode and ball_candidates:
+                        # Find the stability score if we have it
+                        for candidate in ball_candidates:
+                            if candidate['position'] == ball_position and 'stability' in candidate:
+                                stability_text = f"S:{candidate['stability']:.2f}"
+                                cv2.putText(frame, stability_text, (x + radius + 5, y), 
+                                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                                break
+                
+                # Show FPS on the main frame
+                cv2.putText(frame, f"FPS: {self.fps:.1f}", (10, 120), 
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                 
                 # Check for goal with improved logic
                 current_time = time.time()
@@ -419,16 +705,112 @@ class FloorballReferee:
                 if key == ord('q'):
                     break
                 elif key == ord('d'):
-                    show_debug = not show_debug
+                    # Toggle debug mode
+                    self.debug_mode = not self.debug_mode
+                    print(f"Debug mode: {'ON' if self.debug_mode else 'OFF'}")
+                    
+                    # If turning off debug mode, close all debug windows
+                    if not self.debug_mode:
+                        cv2.destroyWindow("Motion Mask")
+                        cv2.destroyWindow("Color Mask")
+                        cv2.destroyWindow("Combined Mask")
+                        cv2.destroyWindow("Ball Candidates")
+                    else:
+                        # If turning on debug mode, enable all windows by default
+                        self.show_motion_mask = True
+                        self.show_color_mask = True
+                        self.show_combined_mask = True
+                        self.show_candidates = True
+                
+                elif key == ord('1'):
+                    # Toggle motion mask window
+                    self.show_motion_mask = not self.show_motion_mask
+                    if not self.show_motion_mask and self.debug_mode:
+                        cv2.destroyWindow("Motion Mask")
+                
+                elif key == ord('2'):
+                    # Toggle color mask window
+                    self.show_color_mask = not self.show_color_mask
+                    if not self.show_color_mask and self.debug_mode:
+                        cv2.destroyWindow("Color Mask")
+                
+                elif key == ord('3'):
+                    # Toggle combined mask window
+                    self.show_combined_mask = not self.show_combined_mask
+                    if not self.show_combined_mask and self.debug_mode:
+                        cv2.destroyWindow("Combined Mask")
+                
+                elif key == ord('4'):
+                    # Toggle ball candidates window
+                    self.show_candidates = not self.show_candidates
+                    if not self.show_candidates and self.debug_mode:
+                        cv2.destroyWindow("Ball Candidates")
+                        
+                elif key == ord('p'):
+                    # Toggle performance mode - adjust processing parameters for better performance
+                    self.process_every_n_frames = 3 if self.process_every_n_frames == 2 else 2
+                    self.debug_scale = 0.3 if self.debug_scale == 0.5 else 0.5
+                    print(f"Performance mode: Processing every {self.process_every_n_frames} frames, Debug scale: {self.debug_scale}")
+                
                 elif key == ord('a'):
                     # Toggle alternative detection method
                     self.use_alternative_detection = not self.use_alternative_detection
                     print(f"Alternative detection: {'ON' if self.use_alternative_detection else 'OFF'}")
+                
+                elif key == ord('c'):
+                    # Toggle pure color detection (no motion requirement)
+                    self.use_pure_color_detection = not self.use_pure_color_detection
+                    # When disabling pure color detection, use the weights that worked best previously
+                    if not self.use_pure_color_detection:
+                        self.color_detection_weight = 0.9
+                        self.motion_detection_weight = 0.1
+                    else:
+                        self.color_detection_weight = 1.0
+                        self.motion_detection_weight = 0.0
+                    
+                    print(f"Pure color detection: {'ON' if self.use_pure_color_detection else 'OFF'}")
+                    print(f"Current settings: Color weight: {self.color_detection_weight:.1f}, Motion weight: {self.motion_detection_weight:.1f}")
+                
+                elif key == ord('u'):
+                    # Toggle blue ball detection
+                    self.use_blue_ball = not self.use_blue_ball
+                    print(f"Blue ball detection: {'ON' if self.use_blue_ball else 'OFF'}")
+                    if self.use_blue_ball:
+                        print("Now detecting blue ball - use this mode with a blue ball for better contrast")
+                    else:
+                        print("Now detecting white ball")
+                    
+                    # Reset any existing detection history when switching ball color
+                    self.ball_history = []
+                    self.recent_positions = []
+                    self.last_valid_detection = None
+                
                 elif key == ord('r'):
                     # Manual reset of ball tracking status
                     self.ball_left_goal_area = True
                     self.ball_left_goal_time = current_time - self.required_time_outside_goal
                     print("Manual reset of ball tracking status")
+                
+                elif key == ord('b'):
+                    # Reset background model
+                    print("Resetting background model...")
+                    self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=50, varThreshold=16, detectShadows=False)
+                    # Allow background subtractor to learn initial background
+                    for _ in range(10):  # Learn from 10 frames
+                        ret, temp_frame = self.camera.read()
+                        if ret:
+                            self.bg_subtractor.apply(temp_frame)
+                
+                elif key == ord('+') or key == ord('='):
+                    # Increase color detection weight
+                    self.color_detection_weight = min(1.0, self.color_detection_weight + 0.1)
+                    self.motion_detection_weight = 1.0 - self.color_detection_weight
+                    print(f"Color weight: {self.color_detection_weight:.1f}, Motion weight: {self.motion_detection_weight:.1f}")
+                elif key == ord('-') or key == ord('_'):
+                    # Decrease color detection weight
+                    self.color_detection_weight = max(0.0, self.color_detection_weight - 0.1)
+                    self.motion_detection_weight = 1.0 - self.color_detection_weight
+                    print(f"Color weight: {self.color_detection_weight:.1f}, Motion weight: {self.motion_detection_weight:.1f}")
                 
             except Exception as e:
                 print(f"Error in main loop: {e}")
