@@ -23,10 +23,17 @@ class FloorballReferee:
         self.goal_sound = None
         self.sound_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "goal_sound.mp3")
         
+        # Add property to track when goal celebration is complete
+        self.celebration_complete = True  # Initially true since no celebration is happening
+        self.goal_cooldown = 5  # seconds between possible goals (base cooldown)
+        self.sound_duration = 0  # Will be set when sound is loaded
+        
         # Try to load the goal sound
         try:
             self.goal_sound = pygame.mixer.Sound(self.sound_file)
-            print(f"Goal sound loaded successfully: {self.sound_file}")
+            # Get sound duration in seconds
+            self.sound_duration = self.goal_sound.get_length()
+            print(f"Goal sound loaded successfully: {self.sound_file} (Duration: {self.sound_duration:.1f}s)")
         except Exception as e:
             print(f"Could not load goal sound: {e}")
             print(f"Please ensure '{self.sound_file}' exists")
@@ -682,6 +689,7 @@ class FloorballReferee:
                 pygame.mixer.stop()  # Stop any currently playing sounds
                 self.goal_sound.play()
                 self.sound_playing = True
+                self.celebration_complete = False  # Start celebration period
                 print("Playing goal sound!")
             except Exception as e:
                 print(f"Error playing sound: {e}")
@@ -741,6 +749,7 @@ class FloorballReferee:
                 if self.sound_playing and not pygame.mixer.get_busy():
                     self.sound_playing = False
                     print("Goal sound finished playing")
+                    self.celebration_complete = True  # Mark the celebration as complete
                 
                 if self.show_replay:
                     self.show_goal_replay()
@@ -877,14 +886,23 @@ class FloorballReferee:
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                 
                 # Show time until next possible goal
-                goal_ready = self.ball_left_goal_area and (current_time - self.ball_left_goal_time >= self.required_time_outside_goal)
+                goal_ready = (self.ball_left_goal_area and 
+                              (current_time - self.ball_left_goal_time >= self.required_time_outside_goal) and 
+                              self.celebration_complete)  # Added celebration check
                 
                 if not goal_ready and self.ball_left_goal_area:
                     # Show time since ball left goal area
                     time_since_left = current_time - self.ball_left_goal_time
                     time_remaining = max(0, self.required_time_outside_goal - time_since_left)
-                    cv2.putText(frame, f"Ball outside goal: {time_since_left:.1f}s / {self.required_time_outside_goal}s", 
-                              (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 165, 0), 2)
+                    
+                    if not self.celebration_complete:
+                        # If celebration is ongoing, show that message instead
+                        cv2.putText(frame, "Celebration in progress...", 
+                                  (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 165, 0), 2)
+                    else:
+                        # Otherwise, show normal countdown
+                        cv2.putText(frame, f"Ball outside goal: {time_since_left:.1f}s / {self.required_time_outside_goal}s", 
+                                  (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 165, 0), 2)
                 elif not self.ball_left_goal_area:
                     cv2.putText(frame, "Ball must leave goal area", 
                               (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
@@ -894,9 +912,9 @@ class FloorballReferee:
                     cv2.putText(frame, f"Cooldown: {cooldown_remaining:.1f}s", 
                               (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
                 
-                # Goal readiness indicator
-                goal_status_color = (0, 255, 0) if (goal_ready and cooldown_remaining == 0) else (0, 0, 255)
-                cv2.putText(frame, "GOAL READY" if (goal_ready and cooldown_remaining == 0) else "NOT READY", 
+                # Goal readiness indicator - now also checks celebration status
+                goal_status_color = (0, 255, 0) if (goal_ready and cooldown_remaining == 0 and self.celebration_complete) else (0, 0, 255)
+                cv2.putText(frame, "GOAL READY" if (goal_ready and cooldown_remaining == 0 and self.celebration_complete) else "NOT READY", 
                           (frame.shape[1] - 150, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, goal_status_color, 2)
                 
                 # If we're recording post-goal, show an indicator
