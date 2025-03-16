@@ -121,6 +121,16 @@ class FloorballReferee:
         self.lower_blue = np.array([100, 50, 50])  # Blue hue, moderate saturation and value
         self.upper_blue = np.array([130, 255, 255])  # Upper blue range
 
+        # Add additional parameters for stricter ball detection and false positive reduction
+        self.min_circularity = 0.65  # Minimum circularity for a ball (0-1 where 1 is perfect circle)
+        self.consecutive_detections_required = 3  # Number of consecutive frames to confirm detection
+        self.consistent_detections = []  # Track recent consistent detections
+        self.use_hough_circles = True  # Enable Hough circle detection for better shape filtering
+        self.hough_param1 = 50  # First parameter of Hough Circle detection (higher = fewer circles)
+        self.hough_param2 = 30  # Second parameter (lower = more circles)
+        self.hough_min_dist = 20  # Minimum distance between detected circles
+        self.min_detection_confidence = 0.7  # Minimum confidence score to display a detection
+
     def initialize_camera(self):
         """Initialize the camera with error handling and retry capability"""
         try:
@@ -199,7 +209,7 @@ class FloorballReferee:
         return True
 
     def detect_ball(self, frame):
-        """Detect the white ball using improved methods with motion detection"""
+        """Detect the white ball using improved methods with motion detection and shape analysis"""
         # Record time for performance measurement
         start_time = time.time()
         
@@ -297,6 +307,14 @@ class FloorballReferee:
         # Sort contours by their potential to be the ball
         ball_candidates = []
         
+        # Create a copy of the original frame for Hough circle detection
+        original_gray = gray.copy()
+        
+        # Two-stage detection:
+        # 1. Find potential candidates from contour analysis (existing)
+        ball_candidates = []
+        
+        # First stage: Find candidates based on contour analysis
         for contour in contours:
             # Filter contours that could be the ball
             area = cv2.contourArea(contour)
@@ -310,72 +328,158 @@ class FloorballReferee:
                 
             circularity = 4 * np.pi * area / (perimeter * perimeter)
             
+            # Apply stricter circularity threshold to reduce floor noise
+            if circularity < self.min_circularity:
+                continue  # Skip non-circular objects
+                
             # Find the minimum enclosing circle
             ((x, y), radius) = cv2.minEnclosingCircle(contour)
             
-            # Check if the detected object matches our criteria for a ball
-            if (self.min_ball_radius <= radius <= self.max_ball_radius):
-                # Score the candidate based on multiple factors
-                shape_score = circularity  # Perfect circle has circularity = 1
-                size_score = 1 - abs(radius - 12) / 15  # Normalize size score (optimal radius around 12px)
+            # Skip unreasonably tiny detections as they're likely noise
+            if radius < 7:  # Slightly increase minimum radius to filter floor spots
+                continue
                 
-                # Calculate motion score based on average pixel intensity in motion mask
-                # at the ball position
-                mask_roi = fg_mask[max(0, int(y-radius)):min(frame.shape[0], int(y+radius)), 
-                                  max(0, int(x-radius)):min(frame.shape[1], int(x+radius))]
-                if mask_roi.size > 0:
-                    motion_score = np.mean(mask_roi) / 255
+            # Score the candidate based on multiple factors
+            shape_score = circularity  # Perfect circle has circularity = 1
+            size_score = 1 - abs(radius - 12) / 15  # Normalize size score (optimal radius around 12px)
+            
+            # Calculate motion score based on average pixel intensity in motion mask
+            # at the ball position
+            mask_roi = fg_mask[max(0, int(y-radius)):min(frame.shape[0], int(y+radius)), 
+                              max(0, int(x-radius)):min(frame.shape[1], int(x+radius))]
+            if mask_roi.size > 0:
+                motion_score = np.mean(mask_roi) / 255
+            else:
+                motion_score = 0
+            
+            # Calculate color score based on selected ball color
+            hsv_roi = hsv[max(0, int(y-radius)):min(frame.shape[0], int(y+radius)), 
+                         max(0, int(x-radius)):min(frame.shape[1], int(x+radius))]
+            if hsv_roi.size > 0:
+                if self.use_blue_ball:
+                    # For blue ball: look for blue hue with good saturation
+                    blue_pixels = np.sum((hsv_roi[:,:,0] > 100) & (hsv_roi[:,:,0] < 130) & 
+                                        (hsv_roi[:,:,1] > 50)) / (hsv_roi.shape[0] * hsv_roi.shape[1])
+                    color_score = blue_pixels
                 else:
-                    motion_score = 0
+                    # For white ball: look for low saturation and high value
+                    white_pixels = np.sum((hsv_roi[:,:,1] < 60) & (hsv_roi[:,:,2] > 160)) / (hsv_roi.shape[0] * hsv_roi.shape[1])
+                    color_score = white_pixels
+            else:
+                color_score = 0
+            
+            # Calculate temporal consistency score if we have history
+            temporal_score = 0
+            if self.ball_history:
+                last_pos = self.ball_history[-1]
+                # Calculate distance to last known position
+                distance = np.sqrt((x - last_pos[0])**2 + (y - last_pos[1])**2)
+                # Normalize distance score - closer is better
+                max_expected_distance = 50  # Maximum expected movement between frames
+                temporal_score = max(0, 1 - (distance / max_expected_distance))
+            else:
+                temporal_score = 0.5  # Neutral score if no history
+            
+            # Weighted total score
+            total_score = (0.3 * shape_score + 0.25 * size_score + 
+                          0.15 * motion_score + 0.2 * color_score + 
+                          0.1 * temporal_score)
+            
+            # Calculate position stability score
+            position = (int(x), int(y))
+            stability_score = self.calculate_position_stability(position)
+            
+            # Adjusted weights for beige floor - prioritize shape and color
+            # Include stability score to penalize stationary objects
+            total_score *= stability_score  # Multiply by stability score as a penalty factor
+            
+            ball_candidates.append({
+                'position': (int(x), int(y), int(radius)),
+                'score': total_score,
+                'area': area,
+                'circularity': circularity,
+                'stability': stability_score
+            })
+        
+        # Second stage: Also try Hough Circle detection for better shape analysis
+        if self.use_hough_circles:
+            # Apply blur to reduce noise for Hough detection
+            blurred = cv2.GaussianBlur(original_gray, (5, 5), 0)
+            
+            # Detect circles using Hough transform
+            circles = cv2.HoughCircles(
+                blurred, 
+                cv2.HOUGH_GRADIENT, 
+                dp=1, 
+                minDist=self.hough_min_dist,
+                param1=self.hough_param1,
+                param2=self.hough_param2,
+                minRadius=self.min_ball_radius,
+                maxRadius=self.max_ball_radius
+            )
+            
+            # If circles are found, add them to candidates
+            if circles is not None:
+                circles = np.round(circles[0, :]).astype("int")
                 
-                # Calculate color score based on selected ball color
-                hsv_roi = hsv[max(0, int(y-radius)):min(frame.shape[0], int(y+radius)), 
-                             max(0, int(x-radius)):min(frame.shape[1], int(x+radius))]
-                if hsv_roi.size > 0:
-                    if self.use_blue_ball:
-                        # For blue ball: look for blue hue with good saturation
-                        blue_pixels = np.sum((hsv_roi[:,:,0] > 100) & (hsv_roi[:,:,0] < 130) & 
-                                            (hsv_roi[:,:,1] > 50)) / (hsv_roi.shape[0] * hsv_roi.shape[1])
-                        color_score = blue_pixels
+                for (x, y, radius) in circles:
+                    # For each Hough circle, check if it matches our color criteria
+                    if radius < self.min_ball_radius or radius > self.max_ball_radius:
+                        continue
+                    
+                    # Calculate color score based on selected ball color
+                    hsv_roi = hsv[max(0, y-radius):min(frame.shape[0], y+radius), 
+                                 max(0, x-radius):min(frame.shape[1], x+radius)]
+                    
+                    if hsv_roi.size > 0:
+                        if self.use_blue_ball:
+                            blue_pixels = np.sum((hsv_roi[:,:,0] > 100) & (hsv_roi[:,:,0] < 130) & 
+                                                (hsv_roi[:,:,1] > 50)) / (hsv_roi.shape[0] * hsv_roi.shape[1])
+                            color_score = blue_pixels
+                        else:
+                            white_pixels = np.sum((hsv_roi[:,:,1] < 60) & (hsv_roi[:,:,2] > 160)) / (hsv_roi.shape[0] * hsv_roi.shape[1])
+                            color_score = white_pixels
                     else:
-                        # For white ball: look for low saturation and high value
-                        white_pixels = np.sum((hsv_roi[:,:,1] < 60) & (hsv_roi[:,:,2] > 160)) / (hsv_roi.shape[0] * hsv_roi.shape[1])
-                        color_score = white_pixels
-                else:
-                    color_score = 0
-                
-                # Calculate temporal consistency score if we have history
-                temporal_score = 0
-                if self.ball_history:
-                    last_pos = self.ball_history[-1]
-                    # Calculate distance to last known position
-                    distance = np.sqrt((x - last_pos[0])**2 + (y - last_pos[1])**2)
-                    # Normalize distance score - closer is better
-                    max_expected_distance = 50  # Maximum expected movement between frames
-                    temporal_score = max(0, 1 - (distance / max_expected_distance))
-                else:
-                    temporal_score = 0.5  # Neutral score if no history
-                
-                # Weighted total score
-                total_score = (0.3 * shape_score + 0.25 * size_score + 
-                              0.15 * motion_score + 0.2 * color_score + 
-                              0.1 * temporal_score)
-                
-                # Calculate position stability score
-                position = (int(x), int(y))
-                stability_score = self.calculate_position_stability(position)
-                
-                # Adjusted weights for beige floor - prioritize shape and color
-                # Include stability score to penalize stationary objects
-                total_score *= stability_score  # Multiply by stability score as a penalty factor
-                
-                ball_candidates.append({
-                    'position': (int(x), int(y), int(radius)),
-                    'score': total_score,
-                    'area': area,
-                    'circularity': circularity,
-                    'stability': stability_score
-                })
+                        color_score = 0
+                    
+                    # If the circle doesn't match our color criteria well, skip it
+                    if color_score < 0.3:  # Require minimum color match for Hough circles
+                        continue
+                    
+                    # Give Hough circles a high circularity score since they're algorithmically detected as circles
+                    circularity = 0.9
+                    
+                    # Calculate temporal consistency score
+                    temporal_score = 0
+                    if self.ball_history:
+                        last_pos = self.ball_history[-1]
+                        distance = np.sqrt((x - last_pos[0])**2 + (y - last_pos[1])**2)
+                        max_expected_distance = 50
+                        temporal_score = max(0, 1 - (distance / max_expected_distance))
+                    else:
+                        temporal_score = 0.5
+                    
+                    # Calculate position stability score
+                    position = (int(x), int(y))
+                    stability_score = self.calculate_position_stability(position)
+                    
+                    # Hough circles get a good default shape and size score
+                    shape_score = 0.9  # High shape score for Hough circles
+                    size_score = 1 - abs(radius - 12) / 15
+                    
+                    # Overall score emphasizes color and shape for Hough circles
+                    total_score = (0.25 * shape_score + 0.25 * size_score + 
+                                   0.1 * temporal_score + 0.4 * color_score) * stability_score
+                    
+                    # Add as a candidate
+                    ball_candidates.append({
+                        'position': (int(x), int(y), int(radius)),
+                        'score': total_score,
+                        'area': np.pi * radius * radius,  # Approximate area
+                        'circularity': circularity,
+                        'stability': stability_score,
+                        'source': 'hough'  # Mark the source for debugging
+                    })
         
         # Debug drawing - only if in debug mode and candidates window is enabled
         if self.debug_mode and self.show_candidates and 'debug_frame' in locals():
@@ -391,7 +495,7 @@ class FloorballReferee:
             small_debug_frame = cv2.resize(debug_frame, (0, 0), fx=debug_scale, fy=debug_scale)
             cv2.imshow("Ball Candidates", small_debug_frame)
         
-        # Select the best candidate
+        # Select the best candidate with improved filtering
         ball_position = None
         candidates_with_info = []  # Store candidates with scores for access from main loop
         
@@ -400,28 +504,52 @@ class FloorballReferee:
             ball_candidates.sort(key=lambda x: x['score'], reverse=True)
             best_candidate = ball_candidates[0]
             
+            # Apply stricter filtering to reduce false positives
             if best_candidate['score'] >= self.ball_confidence_threshold:
-                ball_position = best_candidate['position']
-                self.last_valid_detection = ball_position
-                self.frames_since_valid_detection = 0
+                # Get the position of the best candidate
+                new_pos = best_candidate['position']
                 
-                # Save all candidate info for use in main loop
-                candidates_with_info = ball_candidates.copy()
+                # Use temporal consistency across multiple frames to validate detection
+                # Store this detection in the consistent_detections list
+                self.consistent_detections.append(new_pos)
                 
-                # Update position history with valid detection
-                self.ball_history.append(ball_position)
-                if len(self.ball_history) > 10:
-                    self.ball_history.pop(0)
-                    
-                # Update recent positions for stability tracking
-                self.recent_positions.append((ball_position[0], ball_position[1]))
-                if len(self.recent_positions) > self.frames_to_track:
-                    self.recent_positions.pop(0)
+                # Keep only the most recent detections
+                if len(self.consistent_detections) > self.consecutive_detections_required:
+                    self.consistent_detections.pop(0)
+                
+                # If we have enough consecutive detections, check consistency
+                if len(self.consistent_detections) >= self.consecutive_detections_required:
+                    # Check if the positions are relatively stable (not jumping around)
+                    # Calculate average position
+                    if self.check_detection_stability(self.consistent_detections, max_distance=30):
+                        # Only assign ball_position if we have stable consecutive detections
+                        ball_position = new_pos
+                        self.last_valid_detection = ball_position
+                        self.frames_since_valid_detection = 0
+                        
+                        # Save all candidate info for use in main loop
+                        candidates_with_info = ball_candidates.copy()
+                        
+                        # Update position history with valid detection
+                        self.ball_history.append(ball_position)
+                        if len(self.ball_history) > 10:
+                            self.ball_history.pop(0)
+                            
+                        # Update recent positions for stability tracking
+                        self.recent_positions.append((ball_position[0], ball_position[1]))
+                        if len(self.recent_positions) > self.frames_to_track:
+                            self.recent_positions.pop(0)
+                
+                # Even if we don't have enough consistent detections yet, store this for debugging
+                if new_pos[2] > 7 and best_candidate['score'] > 0.7:  # Only for reasonable candidates
+                    candidates_with_info = ball_candidates.copy()
             else:
-                # No good detection in this frame
+                # Reset consecutive detections if no good detection in this frame
+                self.consistent_detections = []
                 self.frames_since_valid_detection += 1
         else:
-            # No candidates found
+            # Reset consecutive detections if no candidates found
+            self.consistent_detections = []
             self.frames_since_valid_detection += 1
         
         # If we've lost tracking but had a recent valid detection, use that
@@ -482,6 +610,26 @@ class FloorballReferee:
             return 0.5  # Default penalty if not enough history
         
         return 1.0  # No penalty for moving objects
+
+    def check_detection_stability(self, detections, max_distance=30):
+        """Check if a series of detections are stable (not jumping around)"""
+        if len(detections) < 2:
+            return True
+            
+        # Calculate pairwise distances between consecutive detections
+        for i in range(1, len(detections)):
+            prev_x, prev_y, _ = detections[i-1]
+            curr_x, curr_y, _ = detections[i]
+            
+            # Calculate distance
+            distance = np.sqrt((curr_x - prev_x)**2 + (curr_y - prev_y)**2)
+            
+            # If any consecutive detections are too far apart, consider unstable
+            if distance > max_distance:
+                return False
+        
+        # All distances are within acceptable range
+        return True
 
     def is_goal(self, ball_position):
         """Check if the ball is in the goal area"""
@@ -582,6 +730,11 @@ class FloorballReferee:
         print("  - Or color weight 0.9 (press '+' a few times)")
         print("  - Reset background model if lighting changes (press 'b')")
         
+        print("Starting goal detection with improved false-positive filtering")
+        if self.use_hough_circles:
+            print("Using Hough circle detection for better shape analysis")
+        print("Requiring consistent detections across multiple frames")
+        
         while True:
             try:
                 # Check if sound is done playing
@@ -624,18 +777,37 @@ class FloorballReferee:
                 # Draw the detected ball
                 if ball_position:
                     x, y, radius = ball_position
-                    cv2.circle(frame, (x, y), radius, (0, 0, 255), 2)
-                    cv2.circle(frame, (x, y), 2, (0, 0, 255), -1)
                     
-                    # When drawing detected ball, show stability score
-                    if self.debug_mode and ball_candidates:
-                        # Find the stability score if we have it
+                    # Find the best candidate's score if available
+                    best_score = 0
+                    best_source = "unknown"
+                    if ball_candidates:
                         for candidate in ball_candidates:
-                            if candidate['position'] == ball_position and 'stability' in candidate:
-                                stability_text = f"S:{candidate['stability']:.2f}"
-                                cv2.putText(frame, stability_text, (x + radius + 5, y), 
-                                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                            if candidate['position'] == ball_position:
+                                best_score = candidate['score']
+                                if 'source' in candidate:
+                                    best_source = candidate['source']
                                 break
+                        
+                    # Only display high confidence detections to reduce flickering
+                    if best_score >= self.min_detection_confidence or self.frames_since_valid_detection < self.max_frames_without_detection:
+                        cv2.circle(frame, (x, y), radius, (0, 0, 255), 2)
+                        cv2.circle(frame, (x, y), 2, (0, 0, 255), -1)
+                        
+                        # In debug mode, show the detection source and score
+                        if self.debug_mode:
+                            cv2.putText(frame, f"{best_score:.2f} {best_source}", (x + radius + 5, y), 
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                                       
+                            # When drawing detected ball, show stability score
+                            if ball_candidates:
+                                # Find the stability score if we have it
+                                for candidate in ball_candidates:
+                                    if candidate['position'] == ball_position and 'stability' in candidate:
+                                        stability_text = f"S:{candidate['stability']:.2f}"
+                                        cv2.putText(frame, stability_text, (x + radius + 5, y + 15), 
+                                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                                        break
                 
                 # Show FPS on the main frame
                 cv2.putText(frame, f"FPS: {self.fps:.1f}", (10, 120), 
