@@ -138,6 +138,9 @@ class FloorballReferee:
         self.hough_min_dist = 20  # Minimum distance between detected circles
         self.min_detection_confidence = 0.7  # Minimum confidence score to display a detection
 
+        # Add property to track when celebration is in progress
+        self.celebration_in_progress = False
+
     def initialize_camera(self):
         """Initialize the camera with error handling and retry capability"""
         try:
@@ -689,8 +692,8 @@ class FloorballReferee:
                 pygame.mixer.stop()  # Stop any currently playing sounds
                 self.goal_sound.play()
                 self.sound_playing = True
-                self.celebration_complete = False  # Start celebration period
-                print("Playing goal sound!")
+                self.celebration_in_progress = True  # Mark celebration as in progress
+                print("Playing goal sound! No new goals will be detected until celebration ends.")
             except Exception as e:
                 print(f"Error playing sound: {e}")
 
@@ -749,7 +752,7 @@ class FloorballReferee:
                 if self.sound_playing and not pygame.mixer.get_busy():
                     self.sound_playing = False
                     print("Goal sound finished playing")
-                    self.celebration_complete = True  # Mark the celebration as complete
+                    self.celebration_in_progress = False  # End celebration mode
                 
                 if self.show_replay:
                     self.show_goal_replay()
@@ -852,7 +855,9 @@ class FloorballReferee:
                         self.replay_count = 0
                 # Check if enough time has passed since ball left goal area
                 # AND ball is now back in goal area AND we're not in cooldown
-                elif (ball_in_goal_now and not ball_in_goal and 
+                # AND we're not in celebration mode
+                elif (not self.celebration_in_progress and 
+                      ball_in_goal_now and not ball_in_goal and 
                       self.ball_left_goal_area and
                       current_time - self.ball_left_goal_time >= self.required_time_outside_goal and
                       current_time - self.last_goal_time > self.goal_cooldown):
