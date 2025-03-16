@@ -3,6 +3,7 @@ import numpy as np
 import time
 import logging
 import os
+import pygame  # Add this import for sound playback
 from datetime import datetime
 
 # Set up logging
@@ -17,6 +18,22 @@ logging.basicConfig(
 
 class FloorballReferee:
     def __init__(self):
+        # Initialize pygame mixer for audio playback
+        pygame.mixer.init()
+        self.goal_sound = None
+        self.sound_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "goal_sound.mp3")
+        
+        # Try to load the goal sound
+        try:
+            self.goal_sound = pygame.mixer.Sound(self.sound_file)
+            print(f"Goal sound loaded successfully: {self.sound_file}")
+        except Exception as e:
+            print(f"Could not load goal sound: {e}")
+            print(f"Please ensure '{self.sound_file}' exists")
+        
+        # Flag to track if sound is currently playing
+        self.sound_playing = False
+        
         self.camera = None
         self.camera_index = 1  # Try external camera first
         self.goal_area = None
@@ -510,6 +527,17 @@ class FloorballReferee:
                 self.replay_index = 0
                 self.replay_count = 0
 
+    def play_goal_sound(self):
+        """Play the goal celebration sound"""
+        if self.goal_sound and not self.sound_playing:
+            try:
+                pygame.mixer.stop()  # Stop any currently playing sounds
+                self.goal_sound.play()
+                self.sound_playing = True
+                print("Playing goal sound!")
+            except Exception as e:
+                print(f"Error playing sound: {e}")
+
     def run(self):
         """Main function to run the application"""
         if not self.initialize_camera():
@@ -556,6 +584,11 @@ class FloorballReferee:
         
         while True:
             try:
+                # Check if sound is done playing
+                if self.sound_playing and not pygame.mixer.get_busy():
+                    self.sound_playing = False
+                    print("Goal sound finished playing")
+                
                 if self.show_replay:
                     self.show_goal_replay()
                     # No need for additional waitKey here as it's in the replay function
@@ -652,6 +685,9 @@ class FloorballReferee:
                     # Log the goal
                     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     logging.info(f"GOAL! Total count: {self.goal_count} at {timestamp}")
+                    
+                    # Play goal sound
+                    self.play_goal_sound()
                     
                     # Start post-goal recording
                     self.recording_post_goal = True
@@ -811,6 +847,10 @@ class FloorballReferee:
                     self.color_detection_weight = max(0.0, self.color_detection_weight - 0.1)
                     self.motion_detection_weight = 1.0 - self.color_detection_weight
                     print(f"Color weight: {self.color_detection_weight:.1f}, Motion weight: {self.motion_detection_weight:.1f}")
+                elif key == ord('s'):
+                    # Test goal sound
+                    self.play_goal_sound()
+                    print("Testing goal sound")
                 
             except Exception as e:
                 print(f"Error in main loop: {e}")
@@ -818,6 +858,7 @@ class FloorballReferee:
                 time.sleep(0.5)
         
         # Clean up
+        pygame.mixer.quit()  # Properly shut down pygame mixer
         logging.info(f"Session ended. Total goals: {self.goal_count}")
         self.camera.release()
         cv2.destroyAllWindows()

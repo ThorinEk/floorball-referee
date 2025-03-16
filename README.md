@@ -4,12 +4,24 @@
 - Python 3.6 or higher
 - OpenCV (`opencv-python`)
 - NumPy (`numpy`)
+- Pygame (`pygame`) for audio playback
 - A webcam or camera connected to your computer
 
 ## Installation
 ```bash
-pip install opencv-python numpy
+pip install -r requirements.txt
 ```
+
+Or install packages individually:
+```bash
+pip install opencv-python numpy pygame
+```
+
+## Setting Up Goal Sound
+1. Place an MP3 file named `goal_sound.mp3` in the same directory as the script
+2. The sound will automatically play when a goal is detected
+3. The sound can be any length, but a 20-30 second celebration sound works well
+4. You can test the sound by pressing the 's' key during runtime
 
 ## Running the Script
 1. Connect your camera/webcam to the computer
@@ -38,6 +50,7 @@ pip install opencv-python numpy
 2. **Goal Detection**: 
    - The script will track the ball in real-time
    - When the ball enters the defined goal area, it registers a goal
+   - A celebration sound will play when a goal is detected
    - For a goal to count, the ball must:
      - Enter the goal area
      - Have been outside the goal area for at least 5 seconds
@@ -56,6 +69,7 @@ pip install opencv-python numpy
    - `+/-` - Increase/decrease color detection weight (vs. motion weight)
    - `r` - Manually reset ball tracking status
    - `b` - Reset the background model when lighting changes
+   - `s` - Test play the goal sound
 
 ## Ball Detection Options
 
