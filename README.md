@@ -28,7 +28,7 @@ pip install opencv-python numpy pygame
 2. Open a terminal/command prompt
 3. Navigate to the script directory:
    ```bash
-   cd C:/projects/albia/floorball-referee
+   cd path/to/floorball-referee
    ```
 4. Run the script:
    ```bash
@@ -149,5 +149,5 @@ The system includes special handling for static bright areas like sunlight patch
   - Try disconnecting and reconnecting the camera if issues persist
 
 ## Log Files
-The script generates a log file at `C:/projects/albia/floorball-referee/goal_log.txt` 
+The script generates a log file named `goal_log.txt` in the project directory, 
 containing timestamps of detected goals.
